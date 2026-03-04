@@ -19,7 +19,7 @@ import torch.nn as nn
 
 from analyzer.numerical_checker import Alert, AlertConfig
 from storage.sqlite_writer import SQLiteWriter
-from tracer.hook_manager import HookManager, _extract_first_tensor
+from tracer.hook_manager import HookManager, _extract_first_tensor, _is_inplace_module
 from tracer.sampler import Sampler
 from tests.conftest import db_count, db_query
 
@@ -31,6 +31,18 @@ class TwoLayerMLP(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(4, 8)
         self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(8, 2)
+
+    def forward(self, x):
+        return self.fc2(self.relu(self.fc1(x)))
+
+
+class TwoLayerMLPInplaceReLU(nn.Module):
+    """使用 ReLU(inplace=True)，用于测试 inplace 模块仅挂 forward hook。"""
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 8)
+        self.relu = nn.ReLU(inplace=True)
         self.fc2 = nn.Linear(8, 2)
 
     def forward(self, x):
@@ -107,6 +119,22 @@ class TestAttachDetach:
         hm.attach()
         # 每个 module 注册 2 个 handle（fwd + bwd）
         assert len(hm._handles) == 6
+        writer.close()
+
+    def test_inplace_module_only_forward_hook(self, tmp_path):
+        """ReLU(inplace=True) 只注册 forward hook，backward 不注册，训练可正常 backward。"""
+        model = TwoLayerMLPInplaceReLU()
+        hm, writer, db_path = make_hook_manager(model, tmp_path, sampler=Sampler(trace_interval=1))
+        hm.attach()
+        # 3 层：fc1(fwd+bwd), relu(仅 fwd), fc2(fwd+bwd) → 5 handles
+        assert len(hm._handles) == 5
+        hm.set_step(0)
+        loss = model(torch.randn(2, 4)).sum()
+        loss.backward()  # 不应报错
+        writer.flush()
+        # forward 应有 3 条，backward 只有 2 条（relu inplace 无 backward hook）
+        assert db_count(db_path, "layer_stats", "phase='forward'") == 3
+        assert db_count(db_path, "layer_stats", "phase='backward'") == 2
         writer.close()
 
     def test_detach_clears_handles(self, tmp_path):
@@ -383,8 +411,20 @@ class TestFiltering:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# _extract_first_tensor（工具函数）
+# _extract_first_tensor / _is_inplace_module（工具函数）
 # ════════════════════════════════════════════════════════════════════════════════
+
+class TestIsInplaceModule:
+
+    def test_relu_inplace_true(self):
+        assert _is_inplace_module(nn.ReLU(inplace=True)) is True
+
+    def test_relu_inplace_false(self):
+        assert _is_inplace_module(nn.ReLU(inplace=False)) is False
+
+    def test_linear_has_no_inplace(self):
+        assert _is_inplace_module(nn.Linear(4, 8)) is False
+
 
 class TestExtractFirstTensor:
 

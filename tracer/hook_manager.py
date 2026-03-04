@@ -9,6 +9,8 @@ Hook 注册与管理
 
 注意：
   - register_full_backward_hook 是 PyTorch ≥ 1.8 的 API，能正确处理多输入 module
+  - 对 inplace 模块（如 ReLU(inplace=True)）只注册 forward hook，不注册 backward hook，
+    否则 backward 时会与 autograd 冲突导致报错；该层仍可采集前向统计。
   - 为避免影响计算图，所有张量操作都用 detach()
   - hook 内任何异常都被 catch 并打印警告，不会中断训练
 """
@@ -79,6 +81,7 @@ class HookManager:
         """
         注册所有 hook。返回注册的 module 数量。
         重复调用会追加 hook（先调用 detach() 再 attach()）。
+        对 inplace 模块（如 ReLU(inplace=True)）仅注册 forward hook，避免 backward 报错。
         """
         count = 0
         for name, module in self._model.named_modules():
@@ -91,10 +94,19 @@ class HookManager:
             h_fwd = module.register_forward_hook(
                 self._make_forward_hook(name, type(module).__name__)
             )
-            h_bwd = module.register_full_backward_hook(
-                self._make_backward_hook(name, type(module).__name__)
-            )
-            self._handles.extend([h_fwd, h_bwd])
+            self._handles.append(h_fwd)
+
+            # inplace 模块不注册 backward hook，否则 backward 时与 autograd 冲突会报错
+            skip_bwd = _is_inplace_module(module)
+            if not skip_bwd:
+                try:
+                    h_bwd = module.register_full_backward_hook(
+                        self._make_backward_hook(name, type(module).__name__)
+                    )
+                    self._handles.append(h_bwd)
+                except Exception as exc:
+                    # 某些模块或 PyTorch 版本下 backward hook 注册/执行会失败，仅保留 forward
+                    print(f"[Nanny][WARN] skip backward hook @ {name} ({type(module).__name__}): {exc}")
             count += 1
         return count
 
@@ -207,6 +219,14 @@ class HookManager:
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
+
+def _is_inplace_module(module: nn.Module) -> bool:
+    """
+    判断是否为 inplace 模块（如 ReLU(inplace=True)）。
+    此类模块注册 full_backward_hook 会在 backward 时与 autograd 冲突报错，应只挂 forward hook。
+    """
+    return getattr(module, "inplace", False) is True
+
 
 def _extract_first_tensor(obj: Any) -> Optional[torch.Tensor]:
     """
