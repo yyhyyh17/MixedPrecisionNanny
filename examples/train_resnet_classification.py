@@ -142,6 +142,7 @@ def train(
         trace_interval=trace_interval,
         output_dir=output_dir,
         verbose=True,
+        precision="bf16"
     )
 
     global_step = 0

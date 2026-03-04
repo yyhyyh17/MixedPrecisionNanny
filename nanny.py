@@ -48,6 +48,8 @@ class MixedPrecisionNanny:
         trace_interval:   每隔多少 step trace 一次（默认 100）
         output_dir:       数据存储目录（默认 ./nanny_logs）
         alert_config:     告警阈值配置，不传则使用默认值
+        precision:        精度检测目标 "fp16" 或 "bf16"（默认 "fp16"）
+                          仅当未传 alert_config 时生效，否则用 alert_config.precision
         exclude_prefixes: 不监控的层名前缀列表
         max_depth:        只监控层级深度 ≤ max_depth 的 module（None = 不限）
         verbose:          是否打印实时告警和摘要（默认 True）
@@ -60,6 +62,7 @@ class MixedPrecisionNanny:
         trace_interval: int = 100,
         output_dir: str = "./nanny_logs",
         alert_config: Optional[AlertConfig] = None,
+        precision: str = "fp16",
         exclude_prefixes: Optional[List[str]] = None,
         max_depth: Optional[int] = None,
         verbose: bool = True,
@@ -75,11 +78,13 @@ class MixedPrecisionNanny:
 
         self._sampler = Sampler(trace_interval=trace_interval)
 
+        if alert_config is None:
+            alert_config = AlertConfig(precision=precision)
         self._hook_manager = HookManager(
             model=model,
             sampler=self._sampler,
             writer=self._writer,
-            alert_config=alert_config or AlertConfig(),
+            alert_config=alert_config,
             on_alert=self._on_alert,
             exclude_prefixes=exclude_prefixes,
             max_depth=max_depth,

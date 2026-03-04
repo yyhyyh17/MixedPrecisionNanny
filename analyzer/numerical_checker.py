@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import torch
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Literal, Optional, Tuple
 
 # FP16 数值边界
 FP16_MAX: float = 65504.0
 FP16_MIN_NORMAL: float = 6.1e-5   # 最小正规化 FP16
 
-# BF16 数值边界（供参考，目前告警逻辑统一用 FP16 阈值）
+# BF16 数值边界
 BF16_MAX: float = 3.39e38
 BF16_MIN_NORMAL: float = 1.18e-38
 
@@ -53,11 +53,14 @@ class Alert:
 
 @dataclass
 class AlertConfig:
-    # FP16 饱和（溢出）
+    # 精度检测目标："fp16" 或 "bf16"（饱和/下溢阈值据此选择）
+    precision: Literal["fp16", "bf16"] = "fp16"
+
+    # FP16/BF16 饱和（溢出）— 具体阈值由 precision 决定
     saturation_warn_threshold: float = 0.01    # > 1%  → WARNING
     saturation_error_threshold: float = 0.10   # > 10% → ERROR
 
-    # FP16 下溢
+    # FP16/BF16 下溢
     underflow_warn_threshold: float = 0.05     # > 5% 非零值下溢 → WARNING
 
     # 梯度范数（backward 阶段）
@@ -72,14 +75,22 @@ class AlertConfig:
 _DEFAULT_CONFIG = AlertConfig()
 
 
+def _precision_bounds(precision: str) -> Tuple[float, float]:
+    """返回 (max_val, min_normal) 用于饱和/下溢计算。"""
+    if precision == "bf16":
+        return BF16_MAX, BF16_MIN_NORMAL
+    return FP16_MAX, FP16_MIN_NORMAL
+
+
 # ─── 核心：计算统计量 ───────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def compute_stats(tensor: torch.Tensor) -> Optional[TensorStats]:
+def compute_stats(tensor: torch.Tensor, precision: str = "fp16") -> Optional[TensorStats]:
     """
     计算张量的数值统计量。
     - 始终在张量所在设备上运算（GPU 友好）
     - 大张量分位数计算使用随机采样
+    - precision: "fp16" 或 "bf16"，决定饱和/下溢使用的数值边界
     - 返回 None 表示张量为空
     """
     if tensor.numel() == 0:
@@ -115,6 +126,7 @@ def compute_stats(tensor: torch.Tensor) -> Optional[TensorStats]:
         )
 
     abs_finite = finite_vals.abs()
+    prec_max, prec_min_normal = _precision_bounds(precision)
 
     max_val = float(abs_finite.max().item())
     mean_val = float(finite_vals.mean().item())
@@ -134,12 +146,12 @@ def compute_stats(tensor: torch.Tensor) -> Optional[TensorStats]:
     p1 = float(sorted_sample[max(0, int(n * 0.01))].item())
     p99 = float(sorted_sample[min(n - 1, int(n * 0.99))].item())
 
-    # FP16 饱和率：有限值中绝对值超过 0.9 * FP16_MAX 的比例
-    fp16_saturation = float((abs_finite > FP16_MAX * 0.9).float().mean().item())
+    # 饱和率：有限值中绝对值超过 0.9 * prec_max 的比例
+    fp16_saturation = float((abs_finite > prec_max * 0.9).float().mean().item())
 
-    # FP16 下溢率：非零有限值中绝对值小于 FP16_MIN_NORMAL 的比例
+    # 下溢率：非零有限值中绝对值小于 prec_min_normal 的比例
     if nonzero_abs.numel() > 0:
-        fp16_underflow = float((nonzero_abs < FP16_MIN_NORMAL).float().mean().item())
+        fp16_underflow = float((nonzero_abs < prec_min_normal).float().mean().item())
     else:
         fp16_underflow = 0.0
 
@@ -199,14 +211,15 @@ def check_alerts(
             value=float(stats.inf_count),
         ))
 
-    # ── FP16 饱和 / 溢出 ──────────────────────────────────────────────────────
+    # ── FP16/BF16 饱和 / 溢出 ──────────────────────────────────────────────────────
+    prec_label = config.precision.upper()
     sat = stats.fp16_saturation
     if sat >= config.saturation_error_threshold:
         alerts.append(Alert(
             alert_type="OVERFLOW",
             severity="ERROR",
             message=(
-                f"[{phase}] {layer_name}: FP16 saturation {sat:.1%} "
+                f"[{phase}] {layer_name}: {prec_label} saturation {sat:.1%} "
                 f"(threshold ERROR={config.saturation_error_threshold:.0%})"
             ),
             value=sat,
@@ -216,20 +229,20 @@ def check_alerts(
             alert_type="OVERFLOW",
             severity="WARNING",
             message=(
-                f"[{phase}] {layer_name}: FP16 saturation {sat:.1%} "
+                f"[{phase}] {layer_name}: {prec_label} saturation {sat:.1%} "
                 f"(threshold WARN={config.saturation_warn_threshold:.0%})"
             ),
             value=sat,
         ))
 
-    # ── FP16 下溢 ─────────────────────────────────────────────────────────────
+    # ── FP16/BF16 下溢 ─────────────────────────────────────────────────────────────
     udf = stats.fp16_underflow
     if udf >= config.underflow_warn_threshold:
         alerts.append(Alert(
             alert_type="UNDERFLOW",
             severity="WARNING",
             message=(
-                f"[{phase}] {layer_name}: FP16 underflow {udf:.1%} of nonzero values "
+                f"[{phase}] {layer_name}: {prec_label} underflow {udf:.1%} of nonzero values "
                 f"(threshold={config.underflow_warn_threshold:.0%})"
             ),
             value=udf,

@@ -146,7 +146,7 @@ class HookManager:
         layer_type: str,
         phase: str,
     ) -> None:
-        stats = compute_stats(tensor)
+        stats = compute_stats(tensor, precision=self._alert_config.precision)
         if stats is None:
             return
 

@@ -154,6 +154,30 @@ for step, (x, y) in enumerate(dataloader):
 nanny.close()
 ```
 
+### 将精度检测切换为 BF16
+
+默认使用 **FP16** 的数值边界做饱和/下溢检测。若训练使用 **BF16**（`torch.autocast(dtype=torch.bfloat16)`），可改为按 BF16 边界检测：
+
+**方式一：构造时传 `precision`（推荐）**
+
+```python
+nanny = MixedPrecisionNanny(model, trace_interval=100, precision="bf16")
+```
+
+**方式二：通过 `AlertConfig` 指定**
+
+```python
+from analyzer.numerical_checker import AlertConfig
+
+nanny = MixedPrecisionNanny(
+    model,
+    trace_interval=100,
+    alert_config=AlertConfig(precision="bf16"),
+)
+```
+
+切换为 BF16 后，饱和/下溢阈值将使用 BF16 的数值范围（约 3.4e38 / 1.2e-38），告警文案会显示为 “BF16 saturation / BF16 underflow”。
+
 ### 查询监控结果
 
 ```bash
