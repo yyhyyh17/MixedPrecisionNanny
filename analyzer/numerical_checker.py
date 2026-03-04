@@ -71,6 +71,9 @@ class AlertConfig:
     nan_tolerance: int = 0
     inf_tolerance: int = 0
 
+    # 是否使用快速统计（跳过 std、分位数，降低 trace 开销）
+    fast_stats: bool = False
+
 
 _DEFAULT_CONFIG = AlertConfig()
 
@@ -85,12 +88,17 @@ def _precision_bounds(precision: str) -> Tuple[float, float]:
 # ─── 核心：计算统计量 ───────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def compute_stats(tensor: torch.Tensor, precision: str = "fp16") -> Optional[TensorStats]:
+def compute_stats(
+    tensor: torch.Tensor,
+    precision: str = "fp16",
+    fast_stats: bool = False,
+) -> Optional[TensorStats]:
     """
     计算张量的数值统计量。
     - 始终在张量所在设备上运算（GPU 友好）
-    - 大张量分位数计算使用随机采样
+    - 大张量分位数计算使用随机采样（fast_stats=True 时跳过分位数与 std）
     - precision: "fp16" 或 "bf16"，决定饱和/下溢使用的数值边界
+    - fast_stats: 为 True 时跳过 std、p1、p99，减少算力开销
     - 返回 None 表示张量为空
     """
     if tensor.numel() == 0:
@@ -130,21 +138,24 @@ def compute_stats(tensor: torch.Tensor, precision: str = "fp16") -> Optional[Ten
 
     max_val = float(abs_finite.max().item())
     mean_val = float(finite_vals.mean().item())
-    std_val = float(finite_vals.std().item()) if n_finite > 1 else 0.0
+    std_val = float(finite_vals.std().item()) if n_finite > 1 and not fast_stats else 0.0
 
     # 非零最小值
     nonzero_abs = abs_finite[abs_finite > 0]
     min_nonzero = float(nonzero_abs.min().item()) if nonzero_abs.numel() > 0 else 0.0
 
-    # 分位数：随机采样后排序，避免全量 sort 开销
-    sample = finite_vals
-    if sample.numel() > _QUANTILE_SAMPLE_CAP:
-        perm = torch.randperm(sample.numel(), device=sample.device)[:_QUANTILE_SAMPLE_CAP]
-        sample = sample[perm]
-    sorted_sample, _ = sample.sort()
-    n = sorted_sample.numel()
-    p1 = float(sorted_sample[max(0, int(n * 0.01))].item())
-    p99 = float(sorted_sample[min(n - 1, int(n * 0.99))].item())
+    # 分位数：快速模式下跳过（节省采样+排序）
+    if fast_stats:
+        p1, p99 = 0.0, 0.0
+    else:
+        sample = finite_vals
+        if sample.numel() > _QUANTILE_SAMPLE_CAP:
+            perm = torch.randperm(sample.numel(), device=sample.device)[:_QUANTILE_SAMPLE_CAP]
+            sample = sample[perm]
+        sorted_sample, _ = sample.sort()
+        n = sorted_sample.numel()
+        p1 = float(sorted_sample[max(0, int(n * 0.01))].item())
+        p99 = float(sorted_sample[min(n - 1, int(n * 0.99))].item())
 
     # 饱和率：有限值中绝对值超过 0.9 * prec_max 的比例
     fp16_saturation = float((abs_finite > prec_max * 0.9).float().mean().item())

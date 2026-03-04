@@ -45,6 +45,7 @@ class HookManager:
         exclude_prefixes: 跳过名称以这些前缀开头的层（如 ["loss", "criterion"]）
         max_depth:      只监控层级深度 ≤ max_depth 的 module（None = 不限）
                         深度定义：名称中 "." 的数量，例如 "encoder.layer.0" 深度为 2
+        layer_sample_n: 采集时只统计 1/n 的层（按 layer_name 哈希取模）；1 表示全部层，2 表示约一半
     """
 
     def __init__(
@@ -56,6 +57,7 @@ class HookManager:
         on_alert: Optional[Callable[[Alert, int], None]] = None,
         exclude_prefixes: Optional[List[str]] = None,
         max_depth: Optional[int] = None,
+        layer_sample_n: int = 1,
     ):
         self._model = model
         self._sampler = sampler
@@ -64,9 +66,12 @@ class HookManager:
         self._on_alert = on_alert
         self._exclude_prefixes: List[str] = exclude_prefixes or []
         self._max_depth = max_depth
+        self._layer_sample_n = max(1, int(layer_sample_n))
 
         self._handles: List[torch.utils.hooks.RemovableHook] = []
         self._current_step: int = 0
+        # 本 step 是否采集：在 set_step 时算一次，避免每个 hook 都调 should_trace()
+        self._trace_this_step: bool = False
 
     # ─── 公共 API ────────────────────────────────────────────────────────────
 
@@ -100,14 +105,15 @@ class HookManager:
         self._handles.clear()
 
     def set_step(self, step: int) -> None:
-        """由 Nanny 在每个 step 开始前调用，同步当前 step 编号。"""
+        """由 Nanny 在每个 step 开始前调用，同步当前 step 编号并缓存本 step 是否采集。"""
         self._current_step = step
+        self._trace_this_step = self._sampler.should_trace()
 
     # ─── Hook 工厂 ───────────────────────────────────────────────────────────
 
     def _make_forward_hook(self, layer_name: str, layer_type: str):
         def hook(module: nn.Module, inputs: tuple, output: Any) -> None:
-            if not self._sampler.should_trace():
+            if not self._trace_this_step:
                 return
             tensor = _extract_first_tensor(output)
             if tensor is None:
@@ -120,7 +126,7 @@ class HookManager:
 
     def _make_backward_hook(self, layer_name: str, layer_type: str):
         def hook(module: nn.Module, grad_input: tuple, grad_output: tuple) -> None:
-            if not self._sampler.should_trace():
+            if not self._trace_this_step:
                 return
             # grad_output：本 module 输出端流入的梯度（来自上游）
             # 取第一个非 None 的梯度张量
@@ -146,7 +152,14 @@ class HookManager:
         layer_type: str,
         phase: str,
     ) -> None:
-        stats = compute_stats(tensor, precision=self._alert_config.precision)
+        # 层级采样：只统计 1/layer_sample_n 的层，降低 trace 时的 CPU/IO
+        if self._layer_sample_n > 1 and (hash(layer_name) % self._layer_sample_n) != 0:
+            return
+        stats = compute_stats(
+            tensor,
+            precision=self._alert_config.precision,
+            fast_stats=getattr(self._alert_config, "fast_stats", False),
+        )
         if stats is None:
             return
 

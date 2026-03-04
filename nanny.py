@@ -52,6 +52,7 @@ class MixedPrecisionNanny:
                           仅当未传 alert_config 时生效，否则用 alert_config.precision
         exclude_prefixes: 不监控的层名前缀列表
         max_depth:        只监控层级深度 ≤ max_depth 的 module（None = 不限）
+        layer_sample_n:  采集 step 内只统计 1/n 的层（1=全部，2=约一半），可显著降低 trace 开销
         verbose:          是否打印实时告警和摘要（默认 True）
     """
 
@@ -65,6 +66,7 @@ class MixedPrecisionNanny:
         precision: str = "fp16",
         exclude_prefixes: Optional[List[str]] = None,
         max_depth: Optional[int] = None,
+        layer_sample_n: int = 1,
         verbose: bool = True,
     ):
         self._model = model
@@ -88,6 +90,7 @@ class MixedPrecisionNanny:
             on_alert=self._on_alert,
             exclude_prefixes=exclude_prefixes,
             max_depth=max_depth,
+            layer_sample_n=layer_sample_n,
         )
         n_layers = self._hook_manager.attach()
 
@@ -104,7 +107,8 @@ class MixedPrecisionNanny:
             print(
                 f"[Nanny] Attached to {n_layers} layers. "
                 f"trace_interval={trace_interval}. "
-                f"DB → {db_path}"
+                + (f"layer_sample_n={layer_sample_n}. " if layer_sample_n > 1 else "")
+                + f"DB → {db_path}"
             )
 
     # ─── 核心接口：context manager ─────────────────────────────────────────────
