@@ -226,6 +226,17 @@ class TestComputeStats:
         stats = compute_stats(t)
         assert abs(stats.fp16_underflow - 0.5) < 0.01
 
+    def test_exact_zero_ratio(self):
+        """exact_zero_ratio 为全量元素中精确为 0 的比例。"""
+        t = torch.tensor([0.0, 0.0, 1.0, 2.0, 0.0])  # 3/5 = 0.6
+        stats = compute_stats(t)
+        assert abs(stats.exact_zero_ratio - 0.6) < 1e-6
+
+    def test_exact_zero_ratio_all_zeros(self):
+        t = torch.zeros(10)
+        stats = compute_stats(t)
+        assert stats.exact_zero_ratio == 1.0
+
     # ── 性能：大 tensor ─────────────────────────────────────────────────────────
 
     def test_large_tensor_does_not_hang(self):
@@ -365,6 +376,31 @@ class TestCheckAlerts:
         stats = compute_stats(torch.cat([tiny, normal]))
         alerts = _alerts_of_type(check_alerts(stats, "l", "forward"), "UNDERFLOW")
         assert alerts == []
+
+    def test_bf16_direct_underflow_alert_when_zero_ratio_high(self):
+        """BF16 张量 + underflow_zero_ratio_threshold=0.5，零比例≥0.5 时产生 UNDERFLOW 告警。"""
+        cfg = AlertConfig(precision="bf16", underflow_zero_ratio_threshold=0.5)
+        # 构造一个 bfloat16 张量，其中 60% 为 0（模拟下溢后变零）
+        t = torch.zeros(60, dtype=torch.bfloat16)
+        t = torch.cat([t, torch.ones(40, dtype=torch.bfloat16)])
+        stats = compute_stats(t, precision="bf16")
+        assert stats.dtype == "torch.bfloat16"
+        assert abs(stats.exact_zero_ratio - 0.6) < 0.01
+        alerts = _alerts_of_type(check_alerts(stats, "layer", "backward", cfg), "UNDERFLOW")
+        assert len(alerts) >= 1
+        direct = [a for a in alerts if "direct" in a.message or "exact_zero_ratio" in a.message]
+        assert len(direct) == 1
+        assert direct[0].value >= 0.5
+
+    def test_bf16_direct_underflow_disabled_when_threshold_none(self):
+        """underflow_zero_ratio_threshold=None 时不产生高零比例告警。"""
+        cfg = AlertConfig(precision="bf16", underflow_zero_ratio_threshold=None)
+        t = torch.zeros(80, dtype=torch.bfloat16)
+        t = torch.cat([t, torch.ones(20, dtype=torch.bfloat16)])
+        stats = compute_stats(t, precision="bf16")
+        alerts = check_alerts(stats, "layer", "backward", cfg)
+        direct = [a for a in alerts if "exact_zero_ratio" in a.message]
+        assert len(direct) == 0
 
     # ── 梯度爆炸 / 消失 ──────────────────────────────────────────────────────────
 

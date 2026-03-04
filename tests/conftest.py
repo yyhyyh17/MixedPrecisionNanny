@@ -44,6 +44,7 @@ def make_stats(**overrides) -> Any:
         p99=1.0,
         fp16_saturation=0.0,
         fp16_underflow=0.0,
+        exact_zero_ratio=0.0,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

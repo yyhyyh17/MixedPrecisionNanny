@@ -178,6 +178,27 @@ nanny = MixedPrecisionNanny(
 
 切换为 BF16 后，饱和/下溢阈值将使用 BF16 的数值范围（约 3.4e38 / 1.2e-38），告警文案会显示为 “BF16 saturation / BF16 underflow”。
 
+### 工作模式与 BF16 直接训练下的上溢/下溢检测
+
+- **训练精度由用户决定**：Nanny 不强制 FP32。若训练循环使用 `torch.autocast(dtype=torch.bfloat16)`，hook 收到的就是 BF16 张量。
+- **FP32 训练 + 模拟**：当张量为 FP32 时，`fp16_underflow` / `fp16_saturation` 表示「若转为 FP16/BF16，会有多少比例下溢/接近上溢」。
+- **BF16 直接训练时的直接检测**：
+  - **上溢**：通过 **Inf 计数** 与 **saturation（接近 3.4e38 的比例）** 直接发现；BF16 上溢相对少见，但一旦出现会变为 Inf。
+  - **下溢**：在 BF16 中发生下溢的值会变成 **0**，因此无法再通过「小于 min_normal」统计。可启用 **高零比例告警**，将「精确为 0 的比例」超过阈值视为潜在下溢：
+
+```python
+from analyzer.numerical_checker import AlertConfig
+
+# 启用 BF16 直接下溢检测：零比例 > 50% 时告警（可选）
+alert_config = AlertConfig(
+    precision="bf16",
+    underflow_zero_ratio_threshold=0.5,  # None 表示不启用
+)
+nanny = MixedPrecisionNanny(model, trace_interval=100, alert_config=alert_config)
+```
+
+统计中会记录 `exact_zero_ratio`（精确为 0 的元素比例），便于事后分析。
+
 ### 查询监控结果
 
 ```bash

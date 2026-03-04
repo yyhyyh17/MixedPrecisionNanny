@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS layer_stats (
     p99          REAL,
     fp16_sat     REAL,               -- FP16 饱和率
     fp16_udf     REAL,               -- FP16 下溢率
+    exact_zero_ratio REAL,            -- 精确为 0 的比例（BF16/FP16 直接下溢检测）
     ts           REAL                -- Unix timestamp
 );
 
@@ -83,11 +84,11 @@ _INSERT_STATS = """
 INSERT INTO layer_stats
     (step, phase, layer_name, layer_type, dtype,
      nan_count, inf_count, max_val, min_nonzero,
-     mean_val, std_val, p1, p99, fp16_sat, fp16_udf, ts)
+     mean_val, std_val, p1, p99, fp16_sat, fp16_udf, exact_zero_ratio, ts)
 VALUES
     (:step, :phase, :layer_name, :layer_type, :dtype,
      :nan_count, :inf_count, :max_val, :min_nonzero,
-     :mean_val, :std_val, :p1, :p99, :fp16_sat, :fp16_udf, :ts)
+     :mean_val, :std_val, :p1, :p99, :fp16_sat, :fp16_udf, :exact_zero_ratio, :ts)
 """
 
 _INSERT_ALERT = """
@@ -159,6 +160,7 @@ class SQLiteWriter:
             "p99":         stats.p99,
             "fp16_sat":    stats.fp16_saturation,
             "fp16_udf":    stats.fp16_underflow,
+            "exact_zero_ratio": getattr(stats, "exact_zero_ratio", 0.0),
             "ts":          ts or time.time(),
         }))
 
@@ -220,6 +222,11 @@ class SQLiteWriter:
         conn = sqlite3.connect(self.db_path)
         try:
             conn.executescript(_CREATE_TABLES_SQL)
+            # 兼容旧 DB：若表已存在且无 exact_zero_ratio 列则追加
+            try:
+                conn.execute("ALTER TABLE layer_stats ADD COLUMN exact_zero_ratio REAL")
+            except sqlite3.OperationalError:
+                pass  # 列已存在或表结构已包含
             conn.commit()
         finally:
             conn.close()

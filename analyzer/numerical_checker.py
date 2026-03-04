@@ -5,6 +5,15 @@
   - 所有张量运算在原始设备（GPU）上完成，只传标量到 CPU
   - 对大张量随机采样后再计算分位数，避免 O(n log n) 排序开销
   - 统计量与告警规则解耦，方便独立扩展
+
+工作模式说明：
+  - 训练精度由用户决定，Nanny 不强制 FP32。用户用 autocast(dtype=torch.bfloat16) 时，
+    hook 收到的就是 BF16 张量。
+  - FP32 训练 + 模拟：当张量为 FP32 时，fp16_underflow/fp16_saturation 表示「若转为
+    FP16/BF16 会有多少比例下溢/接近上溢」。
+  - BF16/FP16 直接训练：张量已是低精度时，发生下溢的值会变成 0，fp16_underflow 恒为 0。
+    上溢通过 Inf 计数 + saturation 可直接检测；下溢通过 exact_zero_ratio 超过阈值间接检测
+    （需设置 AlertConfig.underflow_zero_ratio_threshold，如 0.5）。
 """
 from __future__ import annotations
 
@@ -41,6 +50,7 @@ class TensorStats:
     p99: float              # 有限值 99% 分位数
     fp16_saturation: float  # 有限值中 |x| > 0.9 * FP16_MAX 的比例
     fp16_underflow: float   # 非零有限值中 |x| < FP16_MIN_NORMAL 的比例
+    exact_zero_ratio: float  # 全量元素中精确为 0 的比例（用于 BF16/FP16 直接下溢检测）
 
 
 @dataclass
@@ -62,6 +72,10 @@ class AlertConfig:
 
     # FP16/BF16 下溢
     underflow_warn_threshold: float = 0.05     # > 5% 非零值下溢 → WARNING
+
+    # BF16/FP16 直接训练模式下的下溢检测：张量已是低精度时，下溢后的值会变成 0
+    # 当 exact_zero_ratio 超过此阈值时告警（潜在下溢）。None 表示不启用（默认）
+    underflow_zero_ratio_threshold: Optional[float] = 0.5
 
     # 梯度范数（backward 阶段）
     grad_explosion_threshold: float = 1e4      # max(|grad|) 超此值 → ERROR
@@ -112,6 +126,9 @@ def compute_stats(
     nan_count = int(nan_mask.sum().item())
     inf_count = int(inf_mask.sum().item())
 
+    # 全量中精确为 0 的比例（BF16/FP16 直接训练时，下溢会变成 0）
+    exact_zero_ratio = float((t == 0).sum().item() / tensor.numel())
+
     # 只对有限值做统计
     finite_vals = t[~nan_mask & ~inf_mask]   # 1-D, on original device
     n_finite = finite_vals.numel()
@@ -131,6 +148,7 @@ def compute_stats(
             p99=float("nan"),
             fp16_saturation=0.0,
             fp16_underflow=0.0,
+            exact_zero_ratio=exact_zero_ratio,
         )
 
     abs_finite = finite_vals.abs()
@@ -180,6 +198,7 @@ def compute_stats(
         p99=p99,
         fp16_saturation=fp16_saturation,
         fp16_underflow=fp16_underflow,
+        exact_zero_ratio=exact_zero_ratio,
     )
 
 
@@ -258,6 +277,23 @@ def check_alerts(
             ),
             value=udf,
         ))
+
+    # ── BF16/FP16 直接训练模式：高零比例 → 潜在下溢 ─────────────────────────────────
+    # 当张量已是 bfloat16/float16 时，发生下溢的值会变成 0，fp16_underflow 恒为 0
+    # 通过 exact_zero_ratio 超过阈值来间接检测“大量下溢”
+    thr = getattr(config, "underflow_zero_ratio_threshold", None)
+    if thr is not None and hasattr(stats, "exact_zero_ratio"):
+        dtype_str = stats.dtype.lower()
+        if ("bfloat16" in dtype_str or "float16" in dtype_str) and stats.exact_zero_ratio >= thr:
+            alerts.append(Alert(
+                alert_type="UNDERFLOW",
+                severity="WARNING",
+                message=(
+                    f"[{phase}] {layer_name}: {prec_label} direct underflow? "
+                    f"exact_zero_ratio={stats.exact_zero_ratio:.1%} (threshold={thr:.0%})"
+                ),
+                value=stats.exact_zero_ratio,
+            ))
 
     # ── 梯度爆炸 / 消失（仅 backward 阶段） ────────────────────────────────────
     if phase == "backward":
