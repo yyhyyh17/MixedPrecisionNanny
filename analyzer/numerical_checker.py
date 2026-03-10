@@ -99,6 +99,28 @@ def _precision_bounds(precision: str) -> Tuple[float, float]:
     return FP16_MAX, FP16_MIN_NORMAL
 
 
+# ─── 快速 NaN/Inf 检测 ──────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def detect_nan_inf_fast(tensor: torch.Tensor) -> Tuple[int, int]:
+    """
+    快速 NaN/Inf 检测，返回 (nan_count, inf_count)。
+
+    先用 isfinite 做单次全量扫描（GPU 上一次 kernel launch）；
+    若全部有限则直接返回 (0, 0)（仅 1 次 GPU→CPU 同步），
+    仅当发现非有限值时才分别计算 NaN 和 Inf 数量。
+
+    适用于非 trace 步的轻量级始终在线检测。
+    """
+    if tensor.numel() == 0:
+        return 0, 0
+    if torch.all(torch.isfinite(tensor)).item():
+        return 0, 0
+    nan_count = int(torch.isnan(tensor).sum().item())
+    inf_count = int(torch.isinf(tensor).sum().item())
+    return nan_count, inf_count
+
+
 # ─── 核心：计算统计量 ───────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -114,32 +136,35 @@ def compute_stats(
     - precision: "fp16" 或 "bf16"，决定饱和/下溢使用的数值边界
     - fast_stats: 为 True 时跳过 std、p1、p99，减少算力开销
     - 返回 None 表示张量为空
+
+    优化：使用 torch.stack + tolist() 批量传输 GPU 标量，
+    将 GPU→CPU 同步点从 ~11 次减少到 1-2 次。
     """
     if tensor.numel() == 0:
         return None
 
-    # 转 float32 保证统计精度，detach 避免影响计算图
     t = tensor.detach().float()
+    numel = tensor.numel()
 
+    # 融合 NaN/Inf 检测：isfinite 一次覆盖两者
+    finite_mask = torch.isfinite(t)
     nan_mask = torch.isnan(t)
-    inf_mask = torch.isinf(t)
-    nan_count = int(nan_mask.sum().item())
-    inf_count = int(inf_mask.sum().item())
 
-    # 全量中精确为 0 的比例（BF16/FP16 直接训练时，下溢会变成 0）
-    exact_zero_ratio = float((t == 0).sum().item() / tensor.numel())
+    nan_sum = nan_mask.sum()
+    inf_sum = (~finite_mask).sum() - nan_sum
+    zero_sum = (t == 0).sum()
 
-    # 只对有限值做统计
-    finite_vals = t[~nan_mask & ~inf_mask]   # 1-D, on original device
+    finite_vals = t[finite_mask]
     n_finite = finite_vals.numel()
 
     if n_finite == 0:
+        batch = torch.stack([nan_sum.float(), inf_sum.float(), zero_sum.float()]).tolist()
         return TensorStats(
             dtype=str(tensor.dtype),
             shape=list(tensor.shape),
-            numel=tensor.numel(),
-            nan_count=nan_count,
-            inf_count=inf_count,
+            numel=numel,
+            nan_count=int(batch[0]),
+            inf_count=int(batch[1]),
             max_val=float("nan"),
             min_nonzero=float("nan"),
             mean_val=float("nan"),
@@ -148,57 +173,73 @@ def compute_stats(
             p99=float("nan"),
             fp16_saturation=0.0,
             fp16_underflow=0.0,
-            exact_zero_ratio=exact_zero_ratio,
+            exact_zero_ratio=batch[2] / numel,
         )
 
     abs_finite = finite_vals.abs()
     prec_max, prec_min_normal = _precision_bounds(precision)
 
-    max_val = float(abs_finite.max().item())
-    mean_val = float(finite_vals.mean().item())
-    std_val = float(finite_vals.std().item()) if n_finite > 1 and not fast_stats else 0.0
-
-    # 非零最小值
     nonzero_abs = abs_finite[abs_finite > 0]
-    min_nonzero = float(nonzero_abs.min().item()) if nonzero_abs.numel() > 0 else 0.0
+    has_nonzero = nonzero_abs.numel() > 0
+
+    # 在 GPU 上累积所有标量，最后一次性传输到 CPU
+    gpu_scalars: list = [
+        nan_sum.float(),             # [0] nan_count
+        inf_sum.float(),             # [1] inf_count
+        zero_sum.float(),            # [2] zero_count → exact_zero_ratio
+        abs_finite.max(),            # [3] max_val
+        finite_vals.mean(),          # [4] mean_val
+    ]
+
+    std_idx = -1
+    if n_finite > 1 and not fast_stats:
+        std_idx = len(gpu_scalars)
+        gpu_scalars.append(finite_vals.std())
+
+    min_nz_idx = -1
+    udf_idx = -1
+    if has_nonzero:
+        min_nz_idx = len(gpu_scalars)
+        gpu_scalars.append(nonzero_abs.min())
+        udf_idx = len(gpu_scalars)
+        gpu_scalars.append((nonzero_abs < prec_min_normal).float().mean())
+
+    sat_idx = len(gpu_scalars)
+    gpu_scalars.append((abs_finite > prec_max * 0.9).float().mean())
 
     # 分位数：快速模式下跳过（节省采样+排序）
-    if fast_stats:
-        p1, p99 = 0.0, 0.0
-    else:
+    p1_idx = -1
+    p99_idx = -1
+    if not fast_stats:
         sample = finite_vals
         if sample.numel() > _QUANTILE_SAMPLE_CAP:
             perm = torch.randperm(sample.numel(), device=sample.device)[:_QUANTILE_SAMPLE_CAP]
             sample = sample[perm]
         sorted_sample, _ = sample.sort()
         n = sorted_sample.numel()
-        p1 = float(sorted_sample[max(0, int(n * 0.01))].item())
-        p99 = float(sorted_sample[min(n - 1, int(n * 0.99))].item())
+        p1_idx = len(gpu_scalars)
+        gpu_scalars.append(sorted_sample[max(0, int(n * 0.01))])
+        p99_idx = len(gpu_scalars)
+        gpu_scalars.append(sorted_sample[min(n - 1, int(n * 0.99))])
 
-    # 饱和率：有限值中绝对值超过 0.9 * prec_max 的比例
-    fp16_saturation = float((abs_finite > prec_max * 0.9).float().mean().item())
-
-    # 下溢率：非零有限值中绝对值小于 prec_min_normal 的比例
-    if nonzero_abs.numel() > 0:
-        fp16_underflow = float((nonzero_abs < prec_min_normal).float().mean().item())
-    else:
-        fp16_underflow = 0.0
+    # === 单次 GPU→CPU 传输（从 ~11 次同步减少到 1 次） ===
+    vals = torch.stack(gpu_scalars).tolist()
 
     return TensorStats(
         dtype=str(tensor.dtype),
         shape=list(tensor.shape),
-        numel=tensor.numel(),
-        nan_count=nan_count,
-        inf_count=inf_count,
-        max_val=max_val,
-        min_nonzero=min_nonzero,
-        mean_val=mean_val,
-        std_val=std_val,
-        p1=p1,
-        p99=p99,
-        fp16_saturation=fp16_saturation,
-        fp16_underflow=fp16_underflow,
-        exact_zero_ratio=exact_zero_ratio,
+        numel=numel,
+        nan_count=int(vals[0]),
+        inf_count=int(vals[1]),
+        max_val=vals[3],
+        min_nonzero=vals[min_nz_idx] if min_nz_idx >= 0 else 0.0,
+        mean_val=vals[4],
+        std_val=vals[std_idx] if std_idx >= 0 else 0.0,
+        p1=vals[p1_idx] if p1_idx >= 0 else 0.0,
+        p99=vals[p99_idx] if p99_idx >= 0 else 0.0,
+        fp16_saturation=vals[sat_idx],
+        fp16_underflow=vals[udf_idx] if udf_idx >= 0 else 0.0,
+        exact_zero_ratio=vals[2] / numel,
     )
 
 
@@ -216,7 +257,7 @@ def check_alerts(
     Args:
         stats:      由 compute_stats() 返回的统计量
         layer_name: 层名称（用于消息拼接）
-        phase:      "forward" 或 "backward"
+        phase:      "forward" | "backward" | "optimizer_grad" | "optimizer_param"
         config:     告警阈值配置
     """
     alerts: List[Alert] = []
@@ -295,15 +336,16 @@ def check_alerts(
                 value=stats.exact_zero_ratio,
             ))
 
-    # ── 梯度爆炸 / 消失（仅 backward 阶段） ────────────────────────────────────
-    if phase == "backward":
+    # ── 梯度爆炸 / 消失（backward 或 optimizer_grad 阶段） ─────────────────────────
+    if phase in ("backward", "optimizer_grad"):
         max_v = stats.max_val
+        phase_label = "optimizer_grad" if phase == "optimizer_grad" else "backward"
         if max_v > config.grad_explosion_threshold:
             alerts.append(Alert(
                 alert_type="GRAD_EXPLOSION",
                 severity="ERROR",
                 message=(
-                    f"[backward] {layer_name}: grad max={max_v:.3e} "
+                    f"[{phase_label}] {layer_name}: grad max={max_v:.3e} "
                     f"(threshold={config.grad_explosion_threshold:.0e})"
                 ),
                 value=max_v,
@@ -313,7 +355,7 @@ def check_alerts(
                 alert_type="GRAD_VANISH",
                 severity="WARNING",
                 message=(
-                    f"[backward] {layer_name}: grad max={max_v:.3e} "
+                    f"[{phase_label}] {layer_name}: grad max={max_v:.3e} "
                     f"(threshold={config.grad_vanish_threshold:.0e})"
                 ),
                 value=max_v,

@@ -5,14 +5,22 @@ MixedPrecisionNanny — 混合精度训练实时监控主入口
 
     from nanny import MixedPrecisionNanny
 
+    # 模式一：逐层 hook（默认），监控每层 forward/backward 的激活与梯度
     nanny = MixedPrecisionNanny(model, scaler=scaler, trace_interval=100)
+
+    # 模式二：optimizer 监控，仅在 optimizer.step() 前后监控梯度与参数（混合精度数值问题）
+    nanny = MixedPrecisionNanny(
+        model, scaler=scaler, optimizer=optimizer,
+        monitor_mode="optimizer", trace_interval=100,
+        check_post_step=True,       # ← 新增：检查更新后参数
+    )
 
     for step, batch in enumerate(dataloader):
         with nanny.step(step):          # ← 唯一侵入点
             with autocast():
                 loss = model(batch)
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
+            scaler.step(optimizer)     # optimizer 模式下在此步前自动检查 grad/param
             scaler.update()
 
     nanny.close()   # 或用 with MixedPrecisionNanny(...) as nanny:
@@ -27,13 +35,14 @@ from __future__ import annotations
 
 import contextlib
 import os
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import torch.nn as nn
 
 from analyzer.numerical_checker import Alert, AlertConfig
 from storage.sqlite_writer import SQLiteWriter
 from tracer.hook_manager import HookManager
+from tracer.optimizer_monitor import OptimizerMonitor
 from tracer.sampler import Sampler
 
 
@@ -45,14 +54,21 @@ class MixedPrecisionNanny:
         model:            被监控的 nn.Module
         scaler:           torch.cuda.amp.GradScaler 实例（可选）
                           传入后会自动记录 Loss Scale 变化历史
+        optimizer:        若 monitor_mode="optimizer" 则必传，用于在 step() 前监控梯度与参数
+        monitor_mode:     "layer" = 在每层注册 forward/backward hook；
+                         "optimizer" = 仅在 optimizer.step() 前监控梯度与参数（混合精度数值问题）
         trace_interval:   每隔多少 step trace 一次（默认 100）
         output_dir:       数据存储目录（默认 ./nanny_logs）
         alert_config:     告警阈值配置，不传则使用默认值
         precision:        精度检测目标 "fp16" 或 "bf16"（默认 "fp16"）
                           仅当未传 alert_config 时生效，否则用 alert_config.precision
-        exclude_prefixes: 不监控的层名前缀列表
-        max_depth:        只监控层级深度 ≤ max_depth 的 module（None = 不限）
+        exclude_prefixes: 不监控的层名前缀列表（仅 layer 模式生效）
+        max_depth:        只监控层级深度 ≤ max_depth 的 module（仅 layer 模式生效，None = 不限）
         layer_sample_n:  采集 step 内只统计 1/n 的层（1=全部，2=约一半），可显著降低 trace 开销
+        always_detect_nan: 非 trace 步也做轻量级 NaN/Inf 检测（仅 layer 模式生效，默认 False）。
+                          开启后消除非采样步的检测盲区，发现 NaN/Inf 立即触发密集采样。
+        check_post_step:  在 optimizer.step() 之后检查参数（仅 optimizer 模式生效，默认 False）。
+                          用于检测更新本身引入的数值问题。
         verbose:          是否打印实时告警和摘要（默认 True）
     """
 
@@ -60,6 +76,8 @@ class MixedPrecisionNanny:
         self,
         model: nn.Module,
         scaler=None,
+        optimizer=None,
+        monitor_mode: Literal["layer", "optimizer"] = "layer",
         trace_interval: int = 100,
         output_dir: str = "./nanny_logs",
         alert_config: Optional[AlertConfig] = None,
@@ -67,10 +85,14 @@ class MixedPrecisionNanny:
         exclude_prefixes: Optional[List[str]] = None,
         max_depth: Optional[int] = None,
         layer_sample_n: int = 1,
+        always_detect_nan: bool = False,
+        check_post_step: bool = False,
         verbose: bool = True,
     ):
         self._model = model
         self._scaler = scaler
+        self._optimizer = optimizer
+        self._monitor_mode = monitor_mode
         self._verbose = verbose
         self._output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
@@ -82,17 +104,37 @@ class MixedPrecisionNanny:
 
         if alert_config is None:
             alert_config = AlertConfig(precision=precision)
-        self._hook_manager = HookManager(
-            model=model,
-            sampler=self._sampler,
-            writer=self._writer,
-            alert_config=alert_config,
-            on_alert=self._on_alert,
-            exclude_prefixes=exclude_prefixes,
-            max_depth=max_depth,
-            layer_sample_n=layer_sample_n,
-        )
-        n_layers = self._hook_manager.attach()
+        self._hook_manager: Optional[HookManager] = None
+        self._optimizer_monitor: Optional[OptimizerMonitor] = None
+        n_layers = 0
+        if monitor_mode == "layer":
+            self._hook_manager = HookManager(
+                model=model,
+                sampler=self._sampler,
+                writer=self._writer,
+                alert_config=alert_config,
+                on_alert=self._on_alert,
+                exclude_prefixes=exclude_prefixes,
+                max_depth=max_depth,
+                layer_sample_n=layer_sample_n,
+                always_detect_nan=always_detect_nan,
+            )
+            n_layers = self._hook_manager.attach()
+        elif monitor_mode == "optimizer":
+            if optimizer is None:
+                raise ValueError("monitor_mode='optimizer' requires optimizer to be passed")
+            self._optimizer_monitor = OptimizerMonitor(
+                model=model,
+                optimizer=optimizer,
+                sampler=self._sampler,
+                writer=self._writer,
+                alert_config=alert_config,
+                on_alert=self._on_alert,
+                param_sample_n=layer_sample_n,
+                check_post_step=check_post_step,
+            )
+            self._optimizer_monitor.attach()
+            n_layers = sum(len(g["params"]) for g in optimizer.param_groups)
 
         # Loss Scale 跟踪：记录上一步的 scale，判断是否发生 overflow
         self._prev_scale: Optional[float] = None
@@ -104,10 +146,18 @@ class MixedPrecisionNanny:
         self._current_step: int = 0
 
         if verbose:
+            extras = []
+            if layer_sample_n > 1:
+                extras.append(f"layer_sample_n={layer_sample_n}")
+            if always_detect_nan and monitor_mode == "layer":
+                extras.append("always_detect_nan=ON")
+            if check_post_step and monitor_mode == "optimizer":
+                extras.append("check_post_step=ON")
             print(
-                f"[Nanny] Attached to {n_layers} layers. "
-                f"trace_interval={trace_interval}. "
-                + (f"layer_sample_n={layer_sample_n}. " if layer_sample_n > 1 else "")
+                f"[Nanny] mode={monitor_mode}. "
+                + (f"Attached to {n_layers} layers. " if monitor_mode == "layer" else f"Monitoring {n_layers} params (optimizer). ")
+                + f"trace_interval={trace_interval}. "
+                + (". ".join(extras) + ". " if extras else "")
                 + f"DB → {db_path}"
             )
 
@@ -135,7 +185,10 @@ class MixedPrecisionNanny:
         self._step_error_count = 0
         self._step_warn_count = 0
         self._sampler.advance(step)
-        self._hook_manager.set_step(step)
+        if self._hook_manager is not None:
+            self._hook_manager.set_step(step)
+        if self._optimizer_monitor is not None:
+            self._optimizer_monitor.set_step(step)
 
     def end_step(self) -> None:
         """在 optimizer.step() 之后调用。记录 scaler 状态并打印摘要。"""
@@ -156,7 +209,12 @@ class MixedPrecisionNanny:
 
     def close(self) -> None:
         """移除 hook，flush，关闭 DB 写入器。"""
-        self._hook_manager.detach()
+        if self._hook_manager is not None:
+            self._hook_manager.detach()
+            self._hook_manager = None
+        if self._optimizer_monitor is not None:
+            self._optimizer_monitor.detach()
+            self._optimizer_monitor = None
         self._writer.flush()
         self._writer.close()
         if self._verbose:

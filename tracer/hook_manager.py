@@ -28,6 +28,7 @@ from analyzer.numerical_checker import (
     TensorStats,
     check_alerts,
     compute_stats,
+    detect_nan_inf_fast,
 )
 from storage.sqlite_writer import SQLiteWriter
 from tracer.sampler import Sampler
@@ -48,6 +49,9 @@ class HookManager:
         max_depth:      只监控层级深度 ≤ max_depth 的 module（None = 不限）
                         深度定义：名称中 "." 的数量，例如 "encoder.layer.0" 深度为 2
         layer_sample_n: 采集时只统计 1/n 的层（按 layer_name 哈希取模）；1 表示全部层，2 表示约一半
+        always_detect_nan: 非 trace 步也做轻量级 NaN/Inf 检测（默认 False）。
+                           开启后每个 hook 调用额外增加一次 isfinite 全量扫描开销，
+                           但能消除非采样步的检测盲区，发现 NaN/Inf 时自动触发密集采样。
     """
 
     def __init__(
@@ -60,6 +64,7 @@ class HookManager:
         exclude_prefixes: Optional[List[str]] = None,
         max_depth: Optional[int] = None,
         layer_sample_n: int = 1,
+        always_detect_nan: bool = False,
     ):
         self._model = model
         self._sampler = sampler
@@ -69,11 +74,13 @@ class HookManager:
         self._exclude_prefixes: List[str] = exclude_prefixes or []
         self._max_depth = max_depth
         self._layer_sample_n = max(1, int(layer_sample_n))
+        self._always_detect_nan = always_detect_nan
 
         self._handles: List[torch.utils.hooks.RemovableHook] = []
         self._current_step: int = 0
-        # 本 step 是否采集：在 set_step 时算一次，避免每个 hook 都调 should_trace()
         self._trace_this_step: bool = False
+        # 预计算的采样层集合：attach() 时构建，_process() 时用 set lookup 替代 hash+取模
+        self._sampled_layers: Optional[set] = None
 
     # ─── 公共 API ────────────────────────────────────────────────────────────
 
@@ -84,8 +91,8 @@ class HookManager:
         对 inplace 模块（如 ReLU(inplace=True)）仅注册 forward hook，避免 backward 报错。
         """
         count = 0
+        registered_names: List[str] = []
         for name, module in self._model.named_modules():
-            # 根模块（name == ""）跳过，它的 output 和子模块重复
             if not name:
                 continue
             if self._should_skip(name):
@@ -96,7 +103,6 @@ class HookManager:
             )
             self._handles.append(h_fwd)
 
-            # inplace 模块不注册 backward hook，否则 backward 时与 autograd 冲突会报错
             skip_bwd = _is_inplace_module(module)
             if not skip_bwd:
                 try:
@@ -105,9 +111,18 @@ class HookManager:
                     )
                     self._handles.append(h_bwd)
                 except Exception as exc:
-                    # 某些模块或 PyTorch 版本下 backward hook 注册/执行会失败，仅保留 forward
                     print(f"[Nanny][WARN] skip backward hook @ {name} ({type(module).__name__}): {exc}")
+            registered_names.append(name)
             count += 1
+
+        # 预计算采样层集合：用 set lookup (O(1)) 替代每次 hook 调用的 hash+取模
+        if self._layer_sample_n > 1:
+            self._sampled_layers = {
+                n for n in registered_names if hash(n) % self._layer_sample_n == 0
+            }
+        else:
+            self._sampled_layers = None  # None 表示全部层都采集
+
         return count
 
     def detach(self) -> None:
@@ -126,6 +141,10 @@ class HookManager:
     def _make_forward_hook(self, layer_name: str, layer_type: str):
         def hook(module: nn.Module, inputs: tuple, output: Any) -> None:
             if not self._trace_this_step:
+                if self._always_detect_nan:
+                    tensor = _extract_first_tensor(output)
+                    if tensor is not None:
+                        self._check_nan_fast(tensor, layer_name, layer_type, "forward")
                 return
             tensor = _extract_first_tensor(output)
             if tensor is None:
@@ -139,9 +158,15 @@ class HookManager:
     def _make_backward_hook(self, layer_name: str, layer_type: str):
         def hook(module: nn.Module, grad_input: tuple, grad_output: tuple) -> None:
             if not self._trace_this_step:
+                if self._always_detect_nan:
+                    for grad in grad_output:
+                        if grad is None:
+                            continue
+                        tensor = _extract_first_tensor(grad)
+                        if tensor is not None:
+                            self._check_nan_fast(tensor, layer_name, layer_type, "backward")
+                            break
                 return
-            # grad_output：本 module 输出端流入的梯度（来自上游）
-            # 取第一个非 None 的梯度张量
             for grad in grad_output:
                 if grad is None:
                     continue
@@ -152,8 +177,60 @@ class HookManager:
                     self._process(tensor, layer_name, layer_type, "backward")
                 except Exception as exc:
                     print(f"[Nanny][WARN] backward hook error @ {layer_name}: {exc}")
-                break  # 每层只处理第一个 grad_output，避免重复统计
+                break
         return hook
+
+    # ─── 轻量级 NaN/Inf 检测（非 trace 步） ───────────────────────────────────
+
+    def _check_nan_fast(
+        self,
+        tensor: torch.Tensor,
+        layer_name: str,
+        layer_type: str,
+        phase: str,
+    ) -> None:
+        """非 trace 步的轻量级 NaN/Inf 检测，发现异常时写入告警并触发密集采样。"""
+        try:
+            nan_count, inf_count = detect_nan_inf_fast(tensor)
+            if nan_count == 0 and inf_count == 0:
+                return
+            ts = time.time()
+            if nan_count > 0:
+                alert = Alert(
+                    alert_type="NAN",
+                    severity="ERROR",
+                    message=(
+                        f"[{phase}] {layer_name}: {nan_count} NaN detected"
+                        f" (fast check, step={self._current_step})"
+                    ),
+                    value=float(nan_count),
+                )
+                self._writer.write_alert(
+                    step=self._current_step, phase=phase, layer_name=layer_name,
+                    alert_type="NAN", severity="ERROR",
+                    message=alert.message, value=alert.value, ts=ts,
+                )
+                if self._on_alert is not None:
+                    self._on_alert(alert, self._current_step)
+            if inf_count > 0:
+                alert = Alert(
+                    alert_type="INF",
+                    severity="ERROR",
+                    message=(
+                        f"[{phase}] {layer_name}: {inf_count} Inf detected"
+                        f" (fast check, step={self._current_step})"
+                    ),
+                    value=float(inf_count),
+                )
+                self._writer.write_alert(
+                    step=self._current_step, phase=phase, layer_name=layer_name,
+                    alert_type="INF", severity="ERROR",
+                    message=alert.message, value=alert.value, ts=ts,
+                )
+                if self._on_alert is not None:
+                    self._on_alert(alert, self._current_step)
+        except Exception:
+            pass
 
     # ─── 核心处理 ────────────────────────────────────────────────────────────
 
@@ -164,8 +241,8 @@ class HookManager:
         layer_type: str,
         phase: str,
     ) -> None:
-        # 层级采样：只统计 1/layer_sample_n 的层，降低 trace 时的 CPU/IO
-        if self._layer_sample_n > 1 and (hash(layer_name) % self._layer_sample_n) != 0:
+        # 层级采样：使用预计算的 set lookup 替代每次 hash+取模
+        if self._sampled_layers is not None and layer_name not in self._sampled_layers:
             return
         stats = compute_stats(
             tensor,
