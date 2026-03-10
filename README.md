@@ -79,12 +79,18 @@ MixedPrecisionNanny/
 │   ├── sampler.py           # 采样策略（周期 / 触发密集采样）
 │   └── hook_manager.py      # PyTorch forward/backward hook 注册与管理
 ├── analyzer/                # 数值分析与告警
-│   └── numerical_checker.py # 张量统计计算 + 告警规则
+│   ├── numerical_checker.py # 张量统计计算 + 告警规则
+│   └── precision_diff.py    # 混合精度 vs FP32 前向传播精度对比分析
 ├── storage/                 # 数据持久化
 │   └── sqlite_writer.py     # 异步 SQLite 写入器（WAL 模式）
+├── visualization/           # 可视化前端
+│   ├── server.py            # Flask Web 服务
+│   └── templates/
+│       └── index.html       # 精度对比可视化仪表盘
 ├── examples/                # 训练示例
 │   ├── train_resnet_classification.py  # ResNet-18 分类训练 + 监控
 │   ├── train_yolo_detection.py         # Tiny-YOLO 检测训练 + 监控
+│   ├── compare_precision.py            # 混合精度 vs FP32 精度对比示例
 │   └── README.md
 ├── tests/                   # 测试套件（183 个测试）
 │   ├── conftest.py          # 公共 fixtures 和工具函数
@@ -104,6 +110,7 @@ MixedPrecisionNanny/
 ├── docs/                    # 设计文档
 ├── check_model.py           # 极简静态检查脚本
 ├── monitor_simple.py        # 极简监控脚本
+├── requirements.txt         # Python 依赖
 └── README.md
 ```
 
@@ -212,6 +219,73 @@ python cli.py alerts --db nanny_logs/metrics.db --severity ERROR
 python cli.py stats --db nanny_logs/metrics.db --step 100
 ```
 
+## 精度对比分析（Precision Diff）
+
+对同一模型和输入，分别以 FP32 和混合精度（FP16/BF16）执行 forward，逐层比较中间结果和最终输出的差异，并提供可视化仪表盘。
+
+### 快速使用
+
+```bash
+# 运行精度对比分析（自动启动可视化服务）
+python examples/compare_precision.py
+
+# 使用 BF16 精度
+python examples/compare_precision.py --precision bf16
+
+# 仅生成报告
+python examples/compare_precision.py --no-server
+```
+
+### 代码集成
+
+```python
+from analyzer.precision_diff import PrecisionDiffAnalyzer
+from visualization.server import launch_server
+
+model = YourModel().eval()
+sample_input = torch.randn(1, 3, 224, 224)
+
+analyzer = PrecisionDiffAnalyzer(model, precision="fp16")
+report = analyzer.analyze(sample_input)
+
+# 保存报告
+report.to_json("nanny_logs/reports/my_report.json")
+
+# 启动可视化服务
+launch_server(report=report, port=8501)
+```
+
+### 对比指标
+
+每层输出会计算以下 diff 指标：
+
+| 指标 | 说明 |
+|------|------|
+| Max Abs Diff | 最大绝对误差 |
+| Mean Abs Diff | 平均绝对误差 |
+| Max Rel Diff | 最大相对误差 |
+| Mean Rel Diff | 平均相对误差 |
+| Cosine Similarity | 余弦相似度（1.0 = 完全一致） |
+| RMSE | 均方根误差 |
+
+### 可视化仪表盘
+
+启动服务后访问 `http://localhost:8501`，可查看：
+
+- **总览卡片**：最终输出 cosine similarity、最大 diff、NaN/Inf 层数等
+- **逐层 Mean Abs Diff 柱状图**（对数坐标）
+- **逐层余弦相似度折线图**
+- **逐层 RMSE 柱状图**
+- **最大相对误差分布直方图**
+- **FP32 vs 混合精度均值对比图**
+- **可排序、可过滤的详细数据表**
+
+### 查看已有报告
+
+```bash
+python visualization/server.py --report nanny_logs/reports/my_report.json
+```
+
 ## 训练示例
 
 `examples/` 目录提供了两个完整的训练示例，展示如何在真实模型中集成监控：
@@ -220,6 +294,7 @@ python cli.py stats --db nanny_logs/metrics.db --step 100
 |------|------|------|------|
 | `train_resnet_classification.py` | ResNet-18 | 图像分类 | 合成 CIFAR-10 数据，SGD 优化 |
 | `train_yolo_detection.py` | Tiny-YOLO | 目标检测 | 合成检测数据，多分支 Loss |
+| `compare_precision.py` | ResNet-18 | 精度对比 | FP32 vs 混合精度逐层 diff 分析 + 可视化 |
 
 ```bash
 # ResNet 分类训练
